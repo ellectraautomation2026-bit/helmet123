@@ -1,0 +1,599 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+
+<title>ESP32 Safety Monitoring</title>
+
+<link rel="stylesheet"
+href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+
+<style>
+*{box-sizing:border-box}
+body{
+ margin:0;
+ font-family:Arial,sans-serif;
+ background:#0e1726;
+ color:white;
+}
+header{
+ display:flex;
+ align-items:center;
+ justify-content:space-between;
+ padding:18px 24px;
+ background:#1b2940;
+}
+header h2{margin:0;font-size:21px}
+button{
+ background:#2563eb;
+ border:0;
+ border-radius:8px;
+ color:white;
+ padding:12px 17px;
+ cursor:pointer;
+}
+main{max-width:1200px;margin:auto;padding:20px}
+.status{
+ text-align:center;
+ padding:17px;
+ border-radius:11px;
+ background:#475569;
+ font-weight:bold;
+ font-size:21px;
+ margin-bottom:18px;
+}
+.safe{background:#166534}
+.danger{background:#b91c1c}
+.grid{
+ display:grid;
+ grid-template-columns:repeat(3,1fr);
+ gap:15px;
+}
+.card,.panel{
+ background:#1c2b41;
+ padding:20px;
+ border-radius:12px;
+}
+.label{color:#aabbd1;font-size:13px}
+.value{
+ font-size:29px;
+ font-weight:bold;
+ margin-top:10px;
+}
+.panel{margin-top:18px}
+#map{height:370px;border-radius:10px}
+input{
+ width:100%;
+ padding:12px;
+ margin:8px 0 16px;
+ border-radius:7px;
+ border:1px solid #52657c;
+ background:#0e1726;
+ color:white;
+}
+.settings{
+ display:none;
+ position:fixed;
+ inset:0;
+ background:#000c;
+ z-index:1000;
+ overflow:auto;
+ padding:20px;
+}
+.settingsBox{
+ max-width:450px;
+ margin:25px auto;
+ padding:25px;
+ background:#1c2b41;
+ border-radius:15px;
+}
+.settingsBox label{
+ font-size:13px;
+ color:#b9c7d8;
+}
+.alertItem{
+ background:#2b3c54;
+ padding:14px;
+ border-radius:8px;
+ border-left:4px solid #ef4444;
+ margin:10px 0;
+}
+.small{color:#aabbd1;font-size:12px}
+a{color:#93c5fd}
+@media(max-width:650px){
+ .grid{grid-template-columns:repeat(2,1fr)}
+ .value{font-size:23px}
+}
+</style>
+</head>
+
+<body>
+<header>
+<h2>ESP32 Safety Monitor</h2>
+<button onclick="openSettings()">Settings</button>
+</header>
+
+<main>
+<div id="status" class="status">CONNECTING...</div>
+
+<div class="grid">
+<div class="card">
+<div class="label">Roll</div>
+<div class="value" id="roll">--</div>
+</div>
+
+<div class="card">
+<div class="label">Pitch</div>
+<div class="value" id="pitch">--</div>
+</div>
+
+<div class="card">
+<div class="label">Heart Rate</div>
+<div class="value" id="bpm">--</div>
+</div>
+
+<div class="card">
+<div class="label">Estimated SpO2</div>
+<div class="value" id="spo2">--</div>
+</div>
+
+<div class="card">
+<div class="label">MAX30102 Finger Contact</div>
+<div class="value" id="contact">Waiting</div>
+</div>
+
+<div class="card">
+<div class="label">MPU6050 Chip Temperature</div>
+<div class="value" id="temp">--</div>
+</div>
+</div>
+
+<div class="panel">
+<h3>Alert Map</h3>
+<div id="map"></div>
+<p class="small">
+Map pins appear only when an alert arrives, using the alert coordinates entered in Settings. No GPS module or SoftAP is used.
+The MPU6050 temperature is its chip reading, not a calibrated ambient-temperature measurement.
+SpO2 is an experimental estimate and must not be used for medical decisions.
+MAX30102 detects finger contact/pulse at its sensor; it does not identify a person at a distance.
+</p>
+</div>
+
+<div class="panel">
+<h3>Remote SMS Command</h3>
+<button onclick="requestLocation()">
+Request Coordinates by SMS
+</button>
+<p class="small">
+ESP32 sends the coordinates entered in Settings and an OpenStreetMap link to
+the configured phone number. Send LOCATION by SMS from that same number to
+request them.
+</p>
+</div>
+
+<div class="panel">
+<h3>Alert History</h3>
+<button onclick="clearHistory()">Clear History</button>
+<div id="alertHistory"></div>
+<p class="small">Alert history is saved in this browser only.</p>
+</div>
+
+<div class="panel">
+<h3>Connection Status</h3>
+<p id="connection">Connecting to EMQX...</p>
+</div>
+</main>
+
+<div class="settings" id="settings">
+<div class="settingsBox">
+
+<h3>Device Settings</h3>
+
+<label>Rollover Angle Threshold</label>
+<input id="rollLimit" type="number"
+value="15" min="15" max="90">
+
+<label>Alert latitude</label>
+<input id="lat" type="number"
+step="any" placeholder="Enter latitude">
+
+<label>Alert longitude</label>
+<input id="lon" type="number"
+step="any" placeholder="Enter longitude">
+
+<button onclick="saveSettings()">Save Settings</button>
+<button onclick="closeSettings()"
+style="background:#475569">Close</button>
+
+<p class="small">
+Settings are saved in this browser and sent to ESP32 over MQTT when connected.
+The ESP32 stores received thresholds and coordinates in flash.
+Coordinates are used only with alert messages and alert map pins; they do not create a normal location marker.
+MQTT credentials in a hosted HTML page are visible to visitors; restrict the broker account to the required topics.
+</p>
+
+</div>
+</div>
+
+<script>
+const MQTT_URL =
+ "wss://y717c21f.ala.eu-central-1.emqxsl.com:8084/mqtt";
+
+const MQTT_USER="ESP32";
+const MQTT_PASS="ESP32";
+
+let client=null;
+let deviceOnline=false;
+let lastTelemetryTime=0;
+
+let history=[];
+let savedSettings={};
+
+try{
+ savedSettings=JSON.parse(
+  localStorage.getItem("esp32_device_settings")||"{}"
+ );
+ if(!savedSettings||typeof savedSettings!=="object"||
+    Array.isArray(savedSettings)) savedSettings={};
+}catch(e){
+ console.error("Could not load saved device settings:",e);
+ savedSettings={};
+}
+
+try{
+ history=JSON.parse(
+  localStorage.getItem("esp32_alert_history")||"[]"
+ );
+ if(!Array.isArray(history)) history=[];
+}catch(e){
+ console.error("Could not load saved alert history:",e);
+ history=[];
+}
+
+const map=L.map("map").setView([20,0],2);
+
+L.tileLayer(
+ "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+ {attribution:"&copy; OpenStreetMap contributors"}
+).addTo(map);
+
+let alertMarkers=[];
+
+function show(id,value,unit=""){
+ document.getElementById(id).textContent=
+  value===null || value===undefined
+  ? "--" : value+unit;
+}
+
+function validCoordinates(lat,lon){
+ return lat!==null && lon!==null && lat!=="" && lon!=="" &&
+  lat!==undefined && lon!==undefined &&
+  Number.isFinite(Number(lat)) &&
+  Number.isFinite(Number(lon)) &&
+  Math.abs(Number(lat))<=90 &&
+  Math.abs(Number(lon))<=180;
+}
+
+function connectMQTT(){
+ client=mqtt.connect(MQTT_URL,{
+  clientId:"ESP32_WEB_"+Math.random().toString(16).slice(2),
+  username:MQTT_USER,
+  password:MQTT_PASS,
+  reconnectPeriod:3000,
+  connectTimeout:10000
+ });
+
+ client.on("connect",()=>{
+  document.getElementById("connection").textContent=
+   "Connected to EMQX broker";
+
+  client.subscribe("ESP32/#",err=>{
+   if(err){
+    document.getElementById("connection").textContent=
+     "Connected to broker, but topic subscription failed: "+err.message;
+    console.error("MQTT subscription failed:",err);
+   }
+  });
+ });
+
+ client.on("reconnect",()=>{
+  document.getElementById("connection").textContent=
+   "Reconnecting to EMQX...";
+ });
+
+ client.on("offline",()=>{
+  document.getElementById("connection").textContent=
+   "MQTT offline; retrying connection...";
+ });
+
+ client.on("message",(topic,payload)=>{
+  const message=payload.toString();
+
+  if(topic==="ESP32/status"){
+   deviceOnline=(message==="online");
+   updateConnection();
+  }
+
+  if(topic==="ESP32/telemetry"){
+   try{
+    const data=JSON.parse(message);
+    lastTelemetryTime=Date.now();
+    updateTelemetry(data);
+   }catch(e){console.error(e)}
+  }
+
+  if(topic==="ESP32/settings"){
+   try{
+    updateSettings(JSON.parse(message));
+   }catch(e){console.error("Invalid device settings message:",e)}
+  }
+
+  if(topic==="ESP32/alert"){
+   try{
+    addAlert(JSON.parse(message));
+   }catch(e){console.error("Invalid alert message:",e)}
+  }
+ });
+
+ client.on("error",e=>{
+  document.getElementById("connection").textContent=
+   "MQTT error: "+e.message;
+ });
+
+ client.on("close",()=>{
+  document.getElementById("connection").textContent=
+   "MQTT disconnected";
+ });
+}
+
+function updateConnection(){
+ document.getElementById("connection").textContent=
+  "MQTT: "+(client && client.connected?"Connected":"Offline")+
+  " | Device: "+(deviceOnline?"Online":"Offline");
+}
+
+function updateTelemetry(d){
+ show("roll",d.roll,"°");
+ show("pitch",d.pitch,"°");
+ show("bpm",d.bpm);
+ show("spo2",d.spo2,"%");
+ show("temp",d.temperature,"°C");
+ show("contact",d.contactDetected?"Detected":"No contact");
+
+ const s=document.getElementById("status");
+
+ if(d.accident){
+  s.className="status danger";
+  s.textContent="POSSIBLE ACCIDENT";
+ }else if(d.mpuOK===false){
+  s.className="status danger";
+  s.textContent="MPU6050 ERROR";
+ }else if(!d.contactDetected){
+  s.className="status";
+  s.textContent="WAITING FOR MAX30102 FINGER CONTACT";
+ }else{
+  s.className="status safe";
+  s.textContent="CONTACT DETECTED - MONITORING";
+ }
+}
+
+function updateSettings(s){
+ if(s.rollLimit!==undefined)
+  document.getElementById("rollLimit").value=s.rollLimit;
+
+ document.getElementById("lat").value=
+  s.lat===null||s.lat===undefined?"":s.lat;
+
+ document.getElementById("lon").value=
+  s.lon===null||s.lon===undefined?"":s.lon;
+
+ savedSettings={...savedSettings,...s};
+ localStorage.setItem(
+  "esp32_device_settings",
+  JSON.stringify(savedSettings)
+ );
+}
+
+function addAlert(a){
+ if(!a.receivedAt) a.receivedAt=new Date().toISOString();
+
+ history.unshift(a);
+ history=history.slice(0,200);
+
+ localStorage.setItem(
+  "esp32_alert_history",
+  JSON.stringify(history)
+ );
+
+ renderHistory();
+}
+
+function renderHistory(){
+ const box=document.getElementById("alertHistory");
+ box.replaceChildren();
+
+ alertMarkers.forEach(m=>map.removeLayer(m));
+ alertMarkers=[];
+ map.setView([20,0],2);
+
+ history.forEach(a=>{
+  const div=document.createElement("div");
+  div.className="alertItem";
+
+  const heading=document.createElement("strong");
+  heading.textContent=a.type||"ALERT";
+  div.appendChild(heading);
+
+  const detail=document.createElement("p");
+  detail.textContent=a.details||"";
+  div.appendChild(detail);
+
+  const date=document.createElement("small");
+  const occurredAt=a.receivedAt?new Date(a.receivedAt):null;
+  date.textContent="Time: "+(occurredAt&&!Number.isNaN(occurredAt.getTime())
+   ?occurredAt.toLocaleString():"Time unavailable");
+  div.appendChild(date);
+
+  if(validCoordinates(a.lat,a.lon)){
+   const lat=Number(a.lat);
+   const lon=Number(a.lon);
+
+   const link=document.createElement("a");
+   link.href=
+    "https://www.openstreetmap.org/?mlat="+lat+"&mlon="+lon+
+    "#map=16/"+lat+"/"+lon;
+   link.target="_blank";
+   link.rel="noopener noreferrer";
+   link.textContent=" View on map";
+   div.appendChild(link);
+
+   const popup=document.createElement("div");
+   const popupHeading=document.createElement("strong");
+   popupHeading.textContent=a.type||"Alert";
+   popup.appendChild(popupHeading);
+   const popupDetails=document.createElement("p");
+   popupDetails.textContent=a.details||"";
+   popup.appendChild(popupDetails);
+   const popupTime=document.createElement("small");
+   popupTime.textContent="Time: "+(occurredAt&&!Number.isNaN(occurredAt.getTime())
+    ?occurredAt.toLocaleString():"Time unavailable");
+   popup.appendChild(popupTime);
+   const marker=L.marker([lat,lon]).addTo(map).bindPopup(popup);
+   if(alertMarkers.length===0) map.setView([lat,lon],15);
+   alertMarkers.push(marker);
+  }else{
+   const noCoordinates=document.createElement("small");
+   noCoordinates.textContent="No alert coordinates were configured; this alert cannot be pinned.";
+   div.appendChild(noCoordinates);
+  }
+
+  box.appendChild(div);
+ });
+}
+
+function openSettings(){
+ document.getElementById("settings").style.display="block";
+}
+
+function closeSettings(){
+ document.getElementById("settings").style.display="none";
+}
+
+function saveSettings(){
+ const latText=document.getElementById("lat").value;
+ const lonText=document.getElementById("lon").value;
+ if((latText==="")!==(lonText==="")){
+  alert("Enter both latitude and longitude, or leave both blank.");
+  return;
+ }
+
+ const settings={
+  rollLimit:Number(document.getElementById("rollLimit").value),
+  lat:latText===""?null:Number(latText),
+  lon:lonText===""?null:Number(lonText)
+ };
+
+ if(settings.rollLimit<15||settings.rollLimit>90){
+  alert("Invalid threshold values");
+  return;
+ }
+
+ if(settings.lat!==null &&
+    (settings.lat < -90||settings.lat > 90)){
+  alert("Invalid latitude");
+  return;
+ }
+
+ if(settings.lon!==null &&
+    (settings.lon < -180||settings.lon > 180)){
+  alert("Invalid longitude");
+  return;
+ }
+
+ savedSettings=settings;
+ localStorage.setItem(
+  "esp32_device_settings",
+  JSON.stringify(settings)
+ );
+
+ if(!client||!client.connected){
+  alert("Saved in this browser. ESP32 is offline; reconnect and save again to send settings.");
+  return;
+ }
+
+ client.publish("ESP32/set",JSON.stringify(settings),{qos:1},err=>{
+  if(err){
+   alert("Saved in this browser, but sending settings to ESP32 failed.");
+   console.error("Settings publish failed:",err);
+  }else{
+   alert("Settings saved in this browser and sent to ESP32.");
+   closeSettings();
+  }
+ });
+}
+
+function requestLocation(){
+ if(!client||!client.connected){
+  alert("MQTT not connected");
+  return;
+ }
+
+ client.publish(
+  "ESP32/command",
+  "LOCATION",
+  {qos:1},
+  err=>{
+   if(err){
+    alert("Could not send the location request.");
+    console.error("Location request publish failed:",err);
+   }else{
+    alert("Location SMS requested.");
+   }
+  }
+ );
+}
+
+function clearHistory(){
+ if(!confirm("Clear saved alert history?"))return;
+
+ history=[];
+ localStorage.removeItem("esp32_alert_history");
+ renderHistory();
+}
+
+function loadSavedSettings(){
+ const fields={
+  rollLimit:"rollLimit",
+  lat:"lat",
+  lon:"lon"
+ };
+
+ Object.keys(fields).forEach(key=>{
+  if(savedSettings[key]!==undefined&&savedSettings[key]!==null){
+   document.getElementById(fields[key]).value=savedSettings[key];
+  }
+ });
+}
+
+setInterval(()=>{
+ if(lastTelemetryTime &&
+    Date.now()-lastTelemetryTime>10000){
+  const s=document.getElementById("status");
+  s.className="status";
+  s.textContent="WAITING FOR LIVE DEVICE DATA";
+ }
+ updateConnection();
+},3000);
+
+loadSavedSettings();
+renderHistory();
+connectMQTT();
+</script>
+</body>
+</html>
